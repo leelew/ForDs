@@ -1,7 +1,7 @@
 #-----------------------------------------------------------------------------
 # The topography downscale methods for forcing except precipitation
 #
-# Author: Lu Li
+# Author: Lu Li, Sisi Chen, Zhongwang Wei
 # Reference:
 #   Mei et al. (2020): A Nonparametric Statistical Technique for Spatial 
 #       Downscaling of Precipitation Over High Mountain Asia, 
@@ -103,12 +103,10 @@ def calc_lapse_rate(input_coarse, elevation_coarse):
     return laspe_rate_full
 
 
-def calc_clear_sky_emissivity(air_temperature, case='satt'):
+def calc_clear_sky_emissivity(air_temperature, dew_temperature, case='satt'):
     """Calculate emissivity in clear-sky."""
-    vapor_pressure, _, _, _ = calc_vapor_pressure(air_temperature)
+    vapor_pressure, _, _, _ = calc_vapor_pressure(dew_temperature)
     if case == 'brut': # Brutsaert (1975)
-        return 1.24*(vapor_pressure/air_temperature)**(1/7)
-    elif case == 'brut': # Brutsaert (1975)
         return 1.24*(vapor_pressure/air_temperature)**(1/7)
     elif case == 'satt': # Satterlund (1979)
         return 1.08*(1-np.exp(-vapor_pressure**(air_temperature/2016)))
@@ -170,7 +168,8 @@ def calc_solar_angles_wei(julian_day, hour, latitude, longtitude, center_longtit
     sza = np.degrees(sza)
 
     # Get solar azimuth angle
-    cos_phi = (np.sin(declination) * np.cos(np.radians(latitude))- np.cos(np.radians(w)) * np.cos(declination) * np.sin(np.radians(latitude)))/ np.cos(sun_elev)
+    cos_phi = (np.sin(declination) * np.cos(np.radians(latitude))- \
+        np.cos(np.radians(w)) * np.cos(declination) * np.sin(np.radians(latitude)))/ np.cos(sun_elev)
     saa = np.zeros(sza.shape)
     saa[w <= 0.0] = np.degrees(np.arccos(cos_phi[w <= 0.0]))
     saa[w > 0.0] = 360. - np.degrees(np.arccos(cos_phi[w > 0.0]))
@@ -208,8 +207,90 @@ def calc_solar_angles_colm(julian_day, latitude, longitude):
     return np.arccos(orb_coszen)
 
 
-def calc_shadow_mask():
-    pass
+def calc_shadow_mask(zenith_angle_fine, 
+                     azimuth_angle_fine, 
+                     elevation_fine,
+                     search_radius,
+                     D=90):
+    """calculate shadow mask derived from WRF"""
+    nlat, nlon = elevation_fine.shape
+    shadow_mask = np.zeros_like(zenith_angle_fine) # 2D (lat, lon)
+    
+    for i in range(nlat):
+        for j in range(nlon):
+            # if zenith angle nearly equal to 0, 
+            # shadow mask set to 0
+            if np.sin(zenith_angle_fine[i,j])<1e-2:
+                shadow_mask[i,j] = 0
+
+            # if azimuth belong to (0, 1/4*pi) and (7/4*pi, pi)
+            # search north
+            elif azimuth_angle_fine[i,j]>1.75*np.pi & \
+                azimuth_angle_fine[i,j]<0.25*np.pi:
+                # search N grids along Y-axis 
+                for jj in range(j+1,j+search_radius+1):
+                    # which grids along X-axis at the direction of azimuth
+                    i0 = i+(jj-j)*np.tan(azimuth_angle_fine[i,j])
+                    # previous/now grid along X-axis
+                    i1, i2 = np.floor(i0), np.floor(i0)+1
+                    # how long in now grid
+                    weight = i0-i1
+                    # calculate the angle of delta(z)
+                    dz_angle = np.arctan(weight*elevation_fine[i2,jj]+ \
+                        (1-weight)*elevation_fine[i1,jj]- \
+                                elevation_fine[i,j])/ \
+                                    np.sqrt((D*(jj-j))^2+(D*(i0-i))^2)
+                    # shadow mask if delta(z) angle less than zenith
+                    if np.sin(dz_angle)>np.sin(zenith_angle_fine[i,j]):
+                        shadow_mask[i,j] = 1
+                        break
+
+            # if azimuth belong to (1/4*pi, 3/4*pi)
+            # search east
+            elif azimuth_angle_fine[i,j]<0.75*np.pi:
+                for ii in range(i+1, i+search_radius+1):
+                    j0 = j-(ii-i)*np.tan(np.pi/2.+azimuth_angle_fine[i,j])
+                    j1, j2 = np.floor(j0), np.floor(j0)+1
+                    weight = j0-j1
+                    dxabs = np.sqrt((D*(ii-i))**2+(D*(j0-j))**2)
+                    dz_angle=np.arctan(weight*elevation_fine[ii,j2]+ \
+                        (1.-weight)*elevation_fine([i1,jj]- \
+                                elevation_fine[i,j])/ \
+                                    np.sqrt((D*(ii-i))**2+(D*(j0-j))**2))
+                    if np.sin(dz_angle)>np.sin(zenith_angle_fine[i,j]):
+                        shadow_mask[i,j] = 1
+                        break
+
+            # if azimuth belong to (3/4*pi, 5/4*pi)
+            # search south
+            elif azimuth_angle_fine[i,j]<1.25*np.pi:
+                for jj in range(j-1,j-search_radius,-1):
+                    i0 = i+(jj-j)*np.tan(azimuth_angle_fine[i,j])
+                    i1, i2 = np.floor(i0), np.floor(i0)+1
+                    weight = i0-i1
+                    dz_angle = np.arctan(weight*elevation_fine[i2,jj]+ \
+                        (1-weight)*elevation_fine[i1,jj]- \
+                            elevation_fine[i,j])/ \
+                                    np.sqrt((D*(jj-j))^2+(D*(i0-i))^2)
+                    if np.sin(dz_angle)>np.sin(zenith_angle_fine[i,j]):
+                        shadow_mask[i,j] = 1
+                        break
+                    
+            # if azimuth belong to (5/4*pi, 7/4*pi)
+            # search west
+            else:
+                for ii in range(i-1,i-search_radius,-1):
+                    j0 = j-(ii-i)*np.tan(np.pi/2.+azimuth_angle_fine[i,j])
+                    j1, j2 = np.floor(j0), np.floor(j0)+1
+                    weight = j0-j1
+                    dz_angle=np.arctan(weight*elevation_fine[ii,j2]+ \
+                        (1.-weight)*elevation_fine([i1,jj]- \
+                            elevation_fine[i,j])/ \
+                                np.sqrt((D*(ii-i))**2+(D*(j0-j))**2))
+                    if np.sin(dz_angle)>np.sin(zenith_angle_fine[i,j]):
+                        shadow_mask[i,j] = 1
+                        break                    
+        return shadow_mask
 
 
 def downscale_air_temperature(air_temperature_coarse, 
@@ -305,11 +386,13 @@ def downscale_relative_humidity(air_pressure_fine,
     
 def downscale_in_longwave_radiation(in_longwave_radiation_coarse,
                                     air_temperature_coarse,
+                                    dew_temperature_coarse,
                                     air_temperature_fine,
+                                    dew_temperature_fine,
                                     regridder):
     # calculate emissivity of coarse and fine resolution
-    emissivity_clear_sky_coarse = calc_clear_sky_emissivity(air_temperature_coarse)
-    emissivity_clear_sky_fine = calc_clear_sky_emissivity(air_temperature_fine)
+    emissivity_clear_sky_coarse = calc_clear_sky_emissivity(air_temperature_coarse, dew_temperature_coarse)
+    emissivity_clear_sky_fine = calc_clear_sky_emissivity(air_temperature_fine, dew_temperature_fine)
 
     # calculate all emissivity including both clear-sky and cloudy
     SIGMA = 5.67e-8 # Stefan-Boltzmann constant
@@ -343,14 +426,18 @@ def downscale_in_shortwave_radiation(in_short_radiation_coarse,
                                      aspect_fine,
                                      julian_day,
                                      hour,
-                                     latitude,
+                                     latitude_coarse,
+                                     latitude_fine,
                                      regridder):
     # ------------------------------------------------------------
     # 1. partition short radiation into beam and diffuse radiation
     # ------------------------------------------------------------
+    #TODO: li, check degree or rad
     # calculate solar angles
-    zenith_angle_coarse, azimuth_angle_coarse = calc_solar_angles_chelsa(julian_day,hour,latitude)
-    
+    zenith_angle_coarse, azimuth_angle_coarse = calc_solar_angles_chelsa(julian_day,hour,latitude_coarse)
+    zenith_angle_fine, azimuth_angle_fine = calc_solar_angles_chelsa(julian_day,hour,latitude_fine)
+
+
     # calculate top-of-atmosphere incident short radiation
     S = 1370 # solar constant [W/m^2]
     toa_in_short_radiation_coarse = S*np.cos(zenith_angle_coarse)
@@ -376,11 +463,6 @@ def downscale_in_shortwave_radiation(in_short_radiation_coarse,
     k_fine_interp = regridder(k_coarse)
     diffuse_radiation_fine_interp = regridder(diffuse_radiation_coarse)
     beam_radiation_fine_interp = regridder(beam_radiation_coarse)
-    # FIXME: I am not sure if we could regridd solar angles,
-    #        But Mei did. We actually could use new latitude 
-    #        longtitude to re-calculate it.
-    zenith_angle_fine_interp = regridder(zenith_angle_coarse)
-    azimuth_angle_fine_interp = regridder(azimuth_angle_coarse)
 
     # calculate factor to account for the difference of 
     # optical path length due to pressure difference
@@ -390,9 +472,10 @@ def downscale_in_shortwave_radiation(in_short_radiation_coarse,
     # calcualte the cosine of solar illumination angle, cos(θ), 
     # ranging between −1 and 1, indicates if the sun is below or 
     # above the local horizon (note that values lower than 0 are set to 0);
-    cos_illumination = np.cos(zenith_angle_fine_interp)*np.cos(slope_fine)+ \
-        np.sin(zenith_angle_fine_interp)*np.sin(slope_fine)* \
-            np.cos(azimuth_angle_fine_interp-aspect_fine)
+    # TODO: 
+    cos_illumination = np.cos(zenith_angle_fine)*np.cos(slope_fine)+ \
+        np.sin(zenith_angle_fine)*np.sin(slope_fine)* \
+            np.cos(azimuth_angle_fine-aspect_fine)
     
     # calculate binary shadow mask
     shadow_mask = calc_shadow_mask()
@@ -424,8 +507,9 @@ def downscale_wind_speed(u_wind_speed_coarse,
                          aspect_fine,
                          curvature_fine,
                          regridder): 
+    #TODO: curvature - Jianfeng Huang
     # calculate wind direction
-    wind_direction_coarse = np.arctanh(v_wind_speed_coarse/u_wind_speed_coarse)
+    wind_direction_coarse = np.arctan(v_wind_speed_coarse/u_wind_speed_coarse)
     wind_speed_coarse = np.sqrt(u_wind_speed_coarse**2+v_wind_speed_coarse**2)
 
     # bilinear interpolate wind speed and direction
@@ -468,10 +552,11 @@ def downscale_precipitation_colm(precipitation_coarse,
                     pg*(zs-zg)/zs_max
             elif case == 'liston':
                 #Liston, G. E. and Elder, K.: A meteorological distribution system
-                # for high-resolution terrestrial modeling (MicroMet), J. Hydrometeorol., 7, 217-234, 2006. Equation (33) and Table 1: chi range from January to December:
+                # for high-resolution terrestrial modeling (MicroMet), J. Hydrometeorol., 
+                # 7, 217-234, 2006. Equation (33) and Table 1: chi range from January to December:
                 # [0.35,0.35,0.35,0.30,0.25,0.20,0.20,0.20,0.20,0.25,0.30,0.35] (1/m)
                 precipitation_fine[i*scale:(i+1)*scale, j*scale:(j+1)*scale] = \
-                pg*2.0*0.27e-3*(zs-zg)/(1.0-0.27e-3*(zs-zg))
+                    pg*2.0*0.27e-3*(zs-zg)/(1.0-0.27e-3*(zs-zg))
     return precipitation_fine
 
 
@@ -494,13 +579,14 @@ def downscale_precipitation_mei(air_temperature_coarse,
                                 latitude_coarse,
                                 longtitude_coarse,
                                 latitude_fine,
-                                longtitude_fine
+                                longtitude_fine,
                                 #LAI_coarse,
-                                #LAI_fine
+                                #LAI_fine,
+                                RAIN_THRESHOLD=0.01
                                 ):
     # calculate precipitation mask in coarse resolution
     precipitation_mask_coarse = np.zeros_like(precipitation_coarse)
-    precipitation_mask_coarse[precipitation_coarse>0.1] = 1
+    precipitation_mask_coarse[precipitation_coarse>RAIN_THRESHOLD] = 1
 
     # construct input features
     x = np.stack([air_temperature_coarse,
@@ -540,7 +626,6 @@ def downscale_precipitation_mei(air_temperature_coarse,
     mask_fine = rf_classifer(x_fine)
     value_fine = rf_regressor(x_fine)
     precipitation_fine = mask_fine+value_fine
-    # FIXME: Maybe this reshape method is wrong, need test
     precipitation_fine = precipitation_fine.reshape(len(latitude_fine),len(longtitude_fine),-1)
     return precipitation_fine
 
