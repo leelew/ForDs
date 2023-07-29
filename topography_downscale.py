@@ -10,10 +10,51 @@
 #       Technique. Journal of Hydrometeorology, 21, 93-108.
 #-----------------------------------------------------------------------------
 
+
+import os
+import netCDF4 as nc
 import numpy as np
-import xesmf as xe
+from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
+
+
+def bilinear_interp_from_cdo(outfil_name,
+                             lat_coarse, 
+                             lon_coarse, 
+                             var_coarse,
+                             year,
+                             month,
+                             begin_hour):
+    """bilinear interpolate by cdo"""
+    # save intermediate variables into nc file
+    f = nc.Dataset('{name}_GD_{year:04}_{month:02}_{begin_hour:02}.nc'.format(
+        name=outfil_name, year=year, month=month, begin_hour=begin_hour), 'w', format='NETCDF4')
+    f.createDimension('longitude', size=var_coarse.shape[-1])
+    f.createDimension('latitude', size=var_coarse.shape[-2])
+    f.createDimension('time', size=var_coarse.shape[-3])
+    lon0 = f.createVariable('longitude', 'f4', dimensions='longitude')
+    lat0 = f.createVariable('latitude', 'f4', dimensions='latitude')
+    data = f.createVariable('var', 'f4', dimensions=('time','latitude','longitude'))
+    lon0[:], lat0[:], data[:] = lon_coarse, lat_coarse, var_coarse
+    f.close()
+    # set grid for nc file generated from previous step
+    os.system("cdo setgrid,{in_grid_file} {name}_GD_{year:04}_{month:02}_{begin_hour:02}.nc {name}_GD_{year:04}_{month:02}_{begin_hour:02}_tmp.nc".format(
+        in_grid_file="/tera06/lilu/ForDs/data/scripts/0p1_GD_cdo.txt",
+        name=outfil_name,  year=year, month=month, begin_hour=begin_hour))
+    # remap 0.1 degree to 90m in Guangdong based on prepared weight file
+    os.system("cdo remap,{out_grid_file},{weight_file} {name}_GD_{year:04}_{month:02}_{begin_hour:02}_tmp.nc {name}_GD_{year:04}_{month:02}_{begin_hour:02}_interp.nc".format(
+        out_grid_file="/tera06/lilu/ForDs/data/scripts/90m_GD_cdo.txt",
+        weight_file="/tera06/lilu/ForDs/data/scripts/bilinear_90x90_10801x10801_cdo.nc",
+        name=outfil_name, year=year, month=month, begin_hour=begin_hour))
+    # read var in fine resolution 
+    f = nc.Dataset("{name}_GD_{year:04}_{month:02}_{begin_hour:02}_interp.nc".format(name=outfil_name, year=year, month=month, begin_hour=begin_hour),'r')
+    var_fine = f["var"][:]
+    # remove files
+    os.system("rm -rf {name}_GD_{year:04}_{month:02}_{begin_hour:02}.nc".format(name=outfil_name,  year=year, month=month, begin_hour=begin_hour))
+    os.system("rm -rf {name}_GD_{year:04}_{month:02}_{begin_hour:02}_tmp.nc".format(name=outfil_name, year=year, month=month, begin_hour=begin_hour))
+    #os.system("rm -rf {name}_GD_{year:04}_{month:02}_{begin_hour:02}_interp.nc".format(name=outfil_name, year=year, month=month, begin_hour=begin_hour))
+    return var_fine
 
 
 def calc_vapor_pressure(temperature):
@@ -69,26 +110,33 @@ def calc_dew_temperature(specific_humidity,
 
 
 def calc_lapse_rate(input_coarse, elevation_coarse): 
-    """Calculate lapse rate by regional regression method."""
-    
+    """Calculate lapse rate by regional regression method.
+
+    NOTE: time dimension last
+    """
+     
     def calc_space_diff(x):
         """calculate difference between center grids with nearby eight grids."""
         center = x[1:-1,1:-1]
         return np.stack([x[1:-1,1:-1]-x[:-2,:-2], x[1:-1,1:-1]-x[:-2,1:-1], 
                          x[1:-1,1:-1]-x[:-2,2:],  x[1:-1,1:-1]-x[1:-1,:-2], 
                          x[1:-1,1:-1]-x[1:-1,2:], x[1:-1,1:-1]-x[2:,:-2], 
-                         x[1:-1,1:-1]-x[2:,1:-1], x[1:-1,1:-1]-x[2:,2:]], axis=-1)
+                         x[1:-1,1:-1]-x[2:,1:-1], x[1:-1,1:-1]-x[2:,2:]], axis=0)
     
     def regression(y, x):
         """regression center grids with eight nearby grids"""
-        nx, ny, ngrid = x.shape
-        ones = np.ones_like(x[0,0])
-        lapse_rate = np.full((nx, ny), np.nan)
+        ngrid, nx, ny, nt = y.shape
+        ones = np.ones_like(x[:,0,0])
+        coef = np.full((nx, ny, nt), np.nan)
         for i in range(nx):
             for j in range(ny):
-                lapse_rate[i,j] = np.linalg.lstsq(
-                    y[i,j], np.stack([x[i,j], ones])[0][0])
-        return lapse_rate
+                if (np.isnan(x[:,i,j]).any()) or (np.isnan(y[:,i,j]).any()):
+                    pass
+                else:
+                    
+                    reg = LinearRegression().fit(np.stack([x[:,i,j], ones],axis=-1),y[:,i,j])
+                    coef[i,j] = reg.coef_[:,0]
+        return coef
     
     # calculate different matrix between center grids with nearby eight grids
     y = calc_space_diff(input_coarse)
@@ -96,11 +144,11 @@ def calc_lapse_rate(input_coarse, elevation_coarse):
     
     # calculate laspe rate of input according to elevation
     laspe_rate = regression(y, x)
-    
+
     # enlarge the boundary
-    laspe_rate_full = np.zeros_like(x)*np.nan
+    laspe_rate_full = np.zeros_like(input_coarse)*np.nan
     laspe_rate_full[1:-1,1:-1] = laspe_rate
-    return laspe_rate_full
+    return np.transpose(laspe_rate_full,(2,0,1)) # time first
 
 
 def calc_clear_sky_emissivity(air_temperature, dew_temperature, case='satt'):
@@ -216,8 +264,8 @@ def calc_shadow_mask(zenith_angle_fine,
     nlat, nlon = elevation_fine.shape
     shadow_mask = np.zeros_like(zenith_angle_fine) # 2D (lat, lon)
     
-    for i in range(nlat):
-        for j in range(nlon):
+    for i in range(search_radius, nlat-search_radius):
+        for j in range(search_radius, nlon-search_radius):
             # if zenith angle nearly equal to 0, 
             # shadow mask set to 0
             if np.sin(zenith_angle_fine[i,j])<1e-2:
@@ -225,21 +273,21 @@ def calc_shadow_mask(zenith_angle_fine,
 
             # if azimuth belong to (0, 1/4*pi) and (7/4*pi, pi)
             # search north
-            elif azimuth_angle_fine[i,j]>1.75*np.pi & \
-                azimuth_angle_fine[i,j]<0.25*np.pi:
+            elif (azimuth_angle_fine[i,j]>1.75*np.pi) & \
+                (azimuth_angle_fine[i,j]<0.25*np.pi):
                 # search N grids along Y-axis 
                 for jj in range(j+1,j+search_radius+1):
                     # which grids along X-axis at the direction of azimuth
-                    i0 = i+(jj-j)*np.tan(azimuth_angle_fine[i,j])
+                    i0 = i+(jj-j)*np.tan(azimuth_angle_fine[i,j]-2*np.pi)
                     # previous/now grid along X-axis
-                    i1, i2 = np.floor(i0), np.floor(i0)+1
+                    i1, i2 = int(np.floor(i0)), int(np.floor(i0)+1)
                     # how long in now grid
                     weight = i0-i1
                     # calculate the angle of delta(z)
-                    dz_angle = np.arctan(weight*elevation_fine[i2,jj]+ \
+                    dz_angle = np.arctan((weight*elevation_fine[i2,jj]+ \
                         (1-weight)*elevation_fine[i1,jj]- \
                                 elevation_fine[i,j])/ \
-                                    np.sqrt((D*(jj-j))^2+(D*(i0-i))^2)
+                                    np.sqrt((D*(jj-j))**2+(D*(i0-i))**2))
                     # shadow mask if delta(z) angle less than zenith
                     if np.sin(dz_angle)>np.sin(zenith_angle_fine[i,j]):
                         shadow_mask[i,j] = 1
@@ -247,14 +295,14 @@ def calc_shadow_mask(zenith_angle_fine,
 
             # if azimuth belong to (1/4*pi, 3/4*pi)
             # search east
-            elif azimuth_angle_fine[i,j]<0.75*np.pi:
+            elif (azimuth_angle_fine[i,j]<0.75*np.pi) & \
+                (azimuth_angle_fine[i,j]>0.25*np.pi):
                 for ii in range(i+1, i+search_radius+1):
-                    j0 = j-(ii-i)*np.tan(np.pi/2.+azimuth_angle_fine[i,j])
-                    j1, j2 = np.floor(j0), np.floor(j0)+1
+                    j0 = j-(ii-i)*np.tan(azimuth_angle_fine[i,j]-0.5*np.pi)
+                    j1, j2 = int(np.floor(j0)), int(np.floor(j0)+1)
                     weight = j0-j1
-                    dxabs = np.sqrt((D*(ii-i))**2+(D*(j0-j))**2)
-                    dz_angle=np.arctan(weight*elevation_fine[ii,j2]+ \
-                        (1.-weight)*elevation_fine([i1,jj]- \
+                    dz_angle=np.arctan((weight*elevation_fine[ii,j2]+ \
+                        (1.-weight)*elevation_fine[ii,j1]- \
                                 elevation_fine[i,j])/ \
                                     np.sqrt((D*(ii-i))**2+(D*(j0-j))**2))
                     if np.sin(dz_angle)>np.sin(zenith_angle_fine[i,j]):
@@ -263,28 +311,30 @@ def calc_shadow_mask(zenith_angle_fine,
 
             # if azimuth belong to (3/4*pi, 5/4*pi)
             # search south
-            elif azimuth_angle_fine[i,j]<1.25*np.pi:
+            elif (azimuth_angle_fine[i,j]<1.25*np.pi) & \
+                (azimuth_angle_fine[i,j]>0.75*np.pi):
                 for jj in range(j-1,j-search_radius,-1):
-                    i0 = i+(jj-j)*np.tan(azimuth_angle_fine[i,j])
-                    i1, i2 = np.floor(i0), np.floor(i0)+1
+                    i0 = i+(jj-j)*np.tan(azimuth_angle_fine[i,j]-np.pi)
+                    i1, i2 = int(np.floor(i0)), int(np.floor(i0)+1)
                     weight = i0-i1
-                    dz_angle = np.arctan(weight*elevation_fine[i2,jj]+ \
+                    dz_angle = np.arctan((weight*elevation_fine[i2,jj]+ \
                         (1-weight)*elevation_fine[i1,jj]- \
                             elevation_fine[i,j])/ \
-                                    np.sqrt((D*(jj-j))^2+(D*(i0-i))^2)
+                                    np.sqrt((D*(jj-j))**2+(D*(i0-i))**2))
                     if np.sin(dz_angle)>np.sin(zenith_angle_fine[i,j]):
                         shadow_mask[i,j] = 1
                         break
                     
             # if azimuth belong to (5/4*pi, 7/4*pi)
             # search west
-            else:
+            elif (azimuth_angle_fine[i,j]<1.75*np.pi) & \
+                (azimuth_angle_fine[i,j]>1.25*np.pi):
                 for ii in range(i-1,i-search_radius,-1):
-                    j0 = j-(ii-i)*np.tan(np.pi/2.+azimuth_angle_fine[i,j])
-                    j1, j2 = np.floor(j0), np.floor(j0)+1
+                    j0 = j-(ii-i)*np.tan(azimuth_angle_fine[i,j]-1.5*np.pi)
+                    j1, j2 = int(np.floor(j0)), int(np.floor(j0)+1)
                     weight = j0-j1
-                    dz_angle=np.arctan(weight*elevation_fine[ii,j2]+ \
-                        (1.-weight)*elevation_fine([i1,jj]- \
+                    dz_angle=np.arctan((weight*elevation_fine[ii,j2]+ \
+                        (1.-weight)*elevation_fine[ii,j1]- \
                             elevation_fine[i,j])/ \
                                 np.sqrt((D*(ii-i))**2+(D*(j0-j))**2))
                     if np.sin(dz_angle)>np.sin(zenith_angle_fine[i,j]):
@@ -293,48 +343,58 @@ def calc_shadow_mask(zenith_angle_fine,
         return shadow_mask
 
 
-def downscale_air_temperature(air_temperature_coarse, 
-                              elevation_coarse, 
+def downscale_air_temperature(air_temperature_coarse,
+                              air_temperature_fine_interp, 
+                              elevation_coarse,
+                              elevation_fine_interp, 
                               elevation_fine,
-                              regridder):
+                              lat_coarse,
+                              lon_coarse, year, month, begin_hour):
     # calculate lapse rate for air temperature
-    laspe_rate_coarse = calc_lapse_rate(air_temperature_coarse, elevation_coarse)
-
-    # bilinear interpolate of laspe rate and air temperature and elevation
-    air_temperature_fine_interp = regridder(air_temperature_coarse)
-    laspe_rate_fine_interp = regridder(laspe_rate_coarse)
-    elevation_fine_interp = regridder(elevation_coarse)
-
+    laspe_rate_coarse = calc_lapse_rate(np.transpose(air_temperature_coarse, (1,2,0)), elevation_coarse)
+    print(laspe_rate_coarse.shape)
+    # bilinear interpolate of laspe rate 
+    laspe_rate_fine_interp = bilinear_interp_from_cdo('laspe_rate', 
+                                                      lat_coarse, 
+                                                      lon_coarse, 
+                                                      laspe_rate_coarse, 
+                                                      year,
+                                                      month,
+                                                      begin_hour)
     # downscaling
-    air_temperature_fine = air_temperature_fine_interp + laspe_rate_fine_interp*(
-        elevation_fine-elevation_fine_interp)
+    dz = (elevation_fine-elevation_fine_interp)[np.newaxis]
+    air_temperature_fine = air_temperature_fine_interp + np.multiply(
+            laspe_rate_fine_interp, dz)
     return air_temperature_fine
     
 
 def downscale_dew_temperature(dew_temperature_coarse, 
-                              elevation_coarse, 
+                              dew_temperature_fine_interp, 
+                              elevation_coarse,
+                              elevation_fine_interp, 
                               elevation_fine,
-                              regridder):
+                              lat_coarse,
+                              lon_coarse):
     # calculate lapse rate for dew temperature
     laspe_rate_coarse = calc_lapse_rate(dew_temperature_coarse, elevation_coarse)
-
-    # bilinear interpolate of laspe rate and air temperature and elevation
-    dew_temperature_fine_interp = regridder(dew_temperature_coarse)
-    laspe_rate_fine_interp = regridder(laspe_rate_coarse)
-    elevation_fine_interp = regridder(elevation_coarse)
-
+    # bilinear interpolate of laspe rate
+    laspe_rate_fine_interp = bilinear_interp_from_cdo('laspe_rate', 
+                                                      lat_coarse, 
+                                                      lon_coarse, 
+                                                      laspe_rate_coarse)
     # downscaling
-    dew_temperature_fine = dew_temperature_fine_interp + laspe_rate_fine_interp*(
-        elevation_fine-elevation_fine_interp)
+    dz = (elevation_fine-elevation_fine_interp)[:,:,np.newaxis]
+    dew_temperature_fine = dew_temperature_fine_interp + np.multiply(
+            laspe_rate_fine_interp, dz)
     return dew_temperature_fine
     
 
-def downscale_air_pressure(air_pressure_coarse,
-                           air_temperature_coarse,
+def downscale_air_pressure(air_pressure_fine_interp,
+                           air_temperature_fine_interp,
                            air_temperature_fine,
                            elevation_coarse, 
-                           elevation_fine,
-                           regridder):
+                           elevation_fine_interp,
+                           elevation_fine):
     """The topographic correction method for air pressure. 
     
     It is based on the hydrostatic equation and the Ideal Gas Law 
@@ -347,11 +407,6 @@ def downscale_air_pressure(air_pressure_coarse,
     # constant
     G = 9.81 # gravitational acceleration [m/s^2]
     R = 287 # ideal gas constant [J/kg*K]
-
-    # bilinear interpolate of air temperature, air pressure and elevation
-    air_temperature_fine_interp = regridder(air_temperature_coarse)
-    air_pressure_fine_interp = regridder(air_pressure_coarse)
-    elevation_fine_interp = regridder(elevation_coarse)
 
     # downscaling
     air_pressure_fine = air_pressure_fine_interp*np.exp(
@@ -385,11 +440,14 @@ def downscale_relative_humidity(air_pressure_fine,
     
     
 def downscale_in_longwave_radiation(in_longwave_radiation_coarse,
+                                    in_longwave_radiation_fine_interp,
                                     air_temperature_coarse,
                                     dew_temperature_coarse,
                                     air_temperature_fine,
                                     dew_temperature_fine,
-                                    regridder):
+                                    air_temperature_fine_interp,
+                                    lat_coarse,
+                                    lon_coarse):
     # calculate emissivity of coarse and fine resolution
     emissivity_clear_sky_coarse = calc_clear_sky_emissivity(air_temperature_coarse, dew_temperature_coarse)
     emissivity_clear_sky_fine = calc_clear_sky_emissivity(air_temperature_fine, dew_temperature_fine)
@@ -401,17 +459,21 @@ def downscale_in_longwave_radiation(in_longwave_radiation_coarse,
     # calculate cloudy emissivity
     emissivity_cloudy_coarse = emissivity_all_coarse-emissivity_clear_sky_coarse
 
-    # bilinear interpolate longwave radiation, air temperature, cloudy emissivity
-    in_longwave_radiation_fine_interp = regridder(in_longwave_radiation_coarse)
-    emissivity_cloudy_fine_interp = regridder(emissivity_cloudy_coarse)
-    air_temperature_fine_interp = regridder(air_temperature_coarse)
-
+    # bilinear interpolate cloudy emissivity
+    emissivity_cloudy_fine_interp = bilinear_interp_from_cdo('emissivity_cloudy',
+                                                             lat_coarse,
+                                                             lon_coarse,
+                                                             emissivity_cloudy_coarse)
+    emissivity_all_fine_interp = bilinear_interp_from_cdo('emissivity_all',
+                                                           lat_coarse,
+                                                           lon_coarse,
+                                                           emissivity_all_coarse)
     # calculate all emissivity in fine
     emissivity_all_fine = emissivity_clear_sky_fine+emissivity_cloudy_fine_interp
 
     # downscaling
     in_longwave_radiation_fine = in_longwave_radiation_fine_interp* \
-        (emissivity_all_fine/emissivity_all_coarse)* \
+        (emissivity_all_fine/emissivity_all_fine_interp)* \
             ((air_temperature_fine/air_temperature_fine_interp)**4)
     return in_longwave_radiation_fine
 
@@ -427,8 +489,7 @@ def downscale_in_shortwave_radiation(in_short_radiation_coarse,
                                      julian_day,
                                      hour,
                                      latitude_coarse,
-                                     latitude_fine,
-                                     regridder):
+                                     latitude_fine):
     # ------------------------------------------------------------
     # 1. partition short radiation into beam and diffuse radiation
     # ------------------------------------------------------------
@@ -501,20 +562,14 @@ def downscale_in_shortwave_radiation(in_short_radiation_coarse,
            reflected_radiation_fine
 
 
-def downscale_wind_speed(u_wind_speed_coarse,
-                         v_wind_speed_coarse,
+def downscale_wind_speed(u_wind_speed_fine_interp,
+                         v_wind_speed_fine_interp,
                          slope_fine,
                          aspect_fine,
-                         curvature_fine,
-                         regridder): 
-    #TODO: curvature - Jianfeng Huang
+                         curvature_fine): 
     # calculate wind direction
-    wind_direction_coarse = np.arctan(v_wind_speed_coarse/u_wind_speed_coarse)
-    wind_speed_coarse = np.sqrt(u_wind_speed_coarse**2+v_wind_speed_coarse**2)
-
-    # bilinear interpolate wind speed and direction
-    wind_speed_fine_interp = regridder(wind_speed_coarse)
-    wind_direction_fine_interp = regridder(wind_direction_coarse)
+    wind_direction_fine_interp = np.arctan(v_wind_speed_fine_interp/u_wind_speed_fine_interp)
+    wind_speed_fine_interp = np.sqrt(u_wind_speed_fine_interp**2+v_wind_speed_fine_interp**2)
 
     # compute the slope in the direction of the wind
     slope_wind_direction_fine = slope_fine*np.cos(wind_direction_fine_interp-aspect_fine)
@@ -535,28 +590,45 @@ def downscale_precipitation_colm(precipitation_coarse,
                                  elevation_coarse,
                                  elevation_fine,
                                  case='tesfa'):
-    scale = elevation_fine.shape[0]/elevation_coarse.shape[0]
-    precipitation_fine = np.full((elevation_fine.shape[0], 
-                                  elevation_fine.shape[1],
-                                  precipitation_coarse.shape[-1]), np.nan)
-    for i in range(elevation_coarse.shape[0]):
-        for j in range(elevation_coarse.shape[-1]):
-            zs = elevation_fine[i*scale:(i+1)*scale, j*scale:(j+1)*scale]
-            zs_max = np.nanmax(zs)
-            pg, zg = precipitation_coarse[i,j], elevation_coarse[i,j]
+    # NOTE: only for square inputs
+    scale = round(elevation_fine.shape[0]/elevation_coarse.shape[0])
+    nlat, nlon, nt = precipitation_coarse.shape
+    precipitation_fine = np.full((elevation_fine.shape[0],elevation_fine.shape[1],nt), np.nan)
+    
+    for i in range(nlat):
+        for j in range(nlon):
+            # handle the boundary problem caused by Not-INT scale 
+            if (i != nlat-1) & (j != nlon-1):
+                zs = elevation_fine[i*scale:(i+1)*scale, j*scale:(j+1)*scale]
+            elif (i == nlat-1) & (j != nlon-1):
+                zs = elevation_fine[i*scale:, j*scale:(j+1)*scale]
+            elif (i != nlat-1) & (j == nlon-1):
+                zs = elevation_fine[i*scale:(i+1)*scale, j*scale:]
+            else:
+                zs = elevation_fine[i*scale:, j*scale:]
+            zs = zs[:,:,np.newaxis] # expand dimension for oprend with time dimensions
+            
+            # calculate precip
+            pg, zg = precipitation_coarse[i:i+1,j:j+1], elevation_coarse[i,j]
             if case == 'tesfa':
                 # Tesfa et al, 2020: Exploring Topography-Based Methods for Downscaling
-                # Subgrid Precipitation for Use in Earth System Models. Equation (5)
-                # https://doi.org/ 10.1029/2019JD031456. ERMM methods.
-                precipitation_fine[i*scale:(i+1)*scale, j*scale:(j+1)*scale] = \
-                    pg*(zs-zg)/zs_max
+                # Subgrid Precipitation for Use in Earth System Models. Equation (5).
+                zs_max = np.nanmax(zs)
+                tmp = pg*(zs-zg)/zs_max
             elif case == 'liston':
-                #Liston, G. E. and Elder, K.: A meteorological distribution system
-                # for high-resolution terrestrial modeling (MicroMet), J. Hydrometeorol., 
-                # 7, 217-234, 2006. Equation (33) and Table 1: chi range from January to December:
-                # [0.35,0.35,0.35,0.30,0.25,0.20,0.20,0.20,0.20,0.25,0.30,0.35] (1/m)
-                precipitation_fine[i*scale:(i+1)*scale, j*scale:(j+1)*scale] = \
-                    pg*2.0*0.27e-3*(zs-zg)/(1.0-0.27e-3*(zs-zg))
+                # Liston and Elder: A meteorological distribution system for high-resolution 
+                # terrestrial modeling (MicroMet), J. Hydrometeorol., 2006. 
+                tmp = pg*2.0*0.27e-3*(zs-zg)/(1.0-0.27e-3*(zs-zg))
+           
+            # rewrite in outfile
+            if (i != nlat-1) & (j != nlon-1):
+                precipitation_fine[i*scale:(i+1)*scale, j*scale:(j+1)*scale] = tmp
+            elif (i == nlat-1) & (j != nlon-1):
+                precipitation_fine[i*scale:, j*scale:(j+1)*scale] = tmp
+            elif (i != nlat-1) & (j == nlon-1):
+                precipitation_fine[i*scale:(i+1)*scale, j*scale:] = tmp
+            else:
+                precipitation_fine[i*scale:, j*scale:] = tmp
     return precipitation_fine
 
 
@@ -631,5 +703,113 @@ def downscale_precipitation_mei(air_temperature_coarse,
 
 
 
+if __name__ == '__main__':
+    import time
 
+    # test interpolate by cdo
+    """
+    out_file = '/tera06/lilu/ForDs/data/DEM/MERITDEM/MERITDEM_GD_Aspect.nc'
+    f = nc.Dataset(out_file)
+    lat_out, lon_out = f['lat'][:], f['lon'][:] 
+    in_file = '/tera06/lilu/ForDs/data/forcing/ERA5LAND_GD_2018_01_tp.nc'
+    f = nc.Dataset(in_file)
+    lat_in, lon_in = f['latitude'][:], f['longitude'][:]
+    c = bilinear_interp_from_cdo('a', 
+                                 lat_out, lon_out, 
+                                 np.random.random((2,90,90)))
+    print(c.shape)
+    """
+    
+    # test Magnus formula/air pressure/specific humidity/relative humidity
+    """ 
+    dew_temperature_fine = np.random.random((10801,10801,24))
+    vapor_pressure, a, b, c = calc_vapor_pressure(dew_temperature_fine)
+    print(vapor_pressure.shape, a.shape, b.shape, c.shape)
+    """
 
+    # test air temperature/dew temperature
+    """
+    elevation_coarse = np.random.random((90,90))
+    elevation_fine_interp = np.random.random((10801,10801))
+    elevation_fine = np.random.random((10801,10801))
+    air_temperature_coarse = np.random.random((90,90,24))
+    air_temperature_fine_interp = np.random.random((10801,10801,24))
+    in_file = '/tera06/lilu/ForDs/data/forcing/ERA5LAND_GD_2018_01_tp.nc'
+    f = nc.Dataset(in_file)
+    lat_coarse, lon_coarse = f['latitude'][:], f['longitude'][:]
+    
+    t1 = time.time()
+    air_temperature_fine = downscale_air_temperature(air_temperature_coarse,
+                                                     air_temperature_fine_interp,                                                    
+                                                     elevation_coarse,
+                                                     elevation_fine_interp,
+                                                     elevation_fine,
+                                                     lat_coarse,
+                                                     lon_coarse)
+    t2 = time.time()
+    print(t2-t1)
+    """
+
+    # test longwave radiation
+    """
+    elevation_coarse = np.random.random((90,90))
+    elevation_fine_interp = np.random.random((10801,10801))
+    elevation_fine = np.random.random((10801,10801))
+    air_temperature_coarse = np.random.random((90,90,24))
+    air_temperature_fine = np.random.random((10801,10801,24))
+    air_temperature_fine_interp = np.random.random((10801,10801,24))
+    dew_temperature_coarse = np.random.random((90,90,24))
+    dew_temperature_fine = np.random.random((10801,10801,24))
+    in_longwave_radiation_coarse = np.random.random((90,90,24))
+    in_longwave_radiation_fine_interp = np.random.random((10801,10801,24))
+    in_file = '/tera06/lilu/ForDs/data/forcing/ERA5LAND_GD_2018_01_tp.nc'
+    f = nc.Dataset(in_file)
+    lat_coarse, lon_coarse = f['latitude'][:], f['longitude'][:]
+    t1 = time.time()
+    in_longwave_radiation_fine = downscale_in_longwave_radiation(in_longwave_radiation_coarse,
+                                                                 in_longwave_radiation_fine_interp,
+                                                                 air_temperature_coarse,
+                                                                 dew_temperature_coarse,
+                                                                 air_temperature_fine,
+                                                                 dew_temperature_fine,
+                                                                 air_temperature_fine_interp,
+                                                                 lat_coarse,
+                                                                 lon_coarse)
+    t2 = time.time()
+    print(t2-t1)
+    print(in_longwave_radiation_fine.shape)
+    """
+
+    # test wind 
+
+    # test precipitation
+    """
+    elevation_coarse = np.random.random((90,90))
+    elevation_fine = np.random.random((10801,10801))
+    precipitation_coarse = np.random.random((90,90,24))
+    t1 = time.time()
+    precipitation_fine = downscale_precipitation_colm(precipitation_coarse,
+                                                      elevation_coarse,
+                                                      elevation_fine,
+                                                      case='liston')
+    t2 = time.time()
+    print(t2-t1)
+    print(precipitation_fine.shape)
+    """
+
+    # test shadow mask
+    """
+    np.random.seed(0)
+    zenith_angle_fine = np.random.random((10801,10801))*2*np.pi
+    azimuth_angle_fine = np.random.random((10801,10801))*2*np.pi
+    elevation_fine = np.random.random((10801,10801))
+    t1 = time.time()
+    shadow_mask = calc_shadow_mask(zenith_angle_fine,
+                                   azimuth_angle_fine,
+                                   elevation_fine,
+                                   search_radius=20,
+                                   D=90)
+    t2 = time.time()
+    print(t2-t1)
+    print(shadow_mask)
+    """
