@@ -53,7 +53,7 @@ def bilinear_interp_from_cdo(outfil_name,
     # remove files
     os.system("rm -rf {name}_GD_{year:04}_{month:02}_{begin_hour:02}.nc".format(name=outfil_name,  year=year, month=month, begin_hour=begin_hour))
     os.system("rm -rf {name}_GD_{year:04}_{month:02}_{begin_hour:02}_tmp.nc".format(name=outfil_name, year=year, month=month, begin_hour=begin_hour))
-    #os.system("rm -rf {name}_GD_{year:04}_{month:02}_{begin_hour:02}_interp.nc".format(name=outfil_name, year=year, month=month, begin_hour=begin_hour))
+    os.system("rm -rf {name}_GD_{year:04}_{month:02}_{begin_hour:02}_interp.nc".format(name=outfil_name, year=year, month=month, begin_hour=begin_hour))
     return var_fine
 
 
@@ -133,7 +133,6 @@ def calc_lapse_rate(input_coarse, elevation_coarse):
                 if (np.isnan(x[:,i,j]).any()) or (np.isnan(y[:,i,j]).any()):
                     pass
                 else:
-                    
                     reg = LinearRegression().fit(np.stack([x[:,i,j], ones],axis=-1),y[:,i,j])
                     coef[i,j] = reg.coef_[:,0]
         return coef
@@ -144,11 +143,19 @@ def calc_lapse_rate(input_coarse, elevation_coarse):
     
     # calculate laspe rate of input according to elevation
     laspe_rate = regression(y, x)
+    
+    # control the boundary of lapse rate
+    for i in range(laspe_rate.shape[-1]):
+        tmp = laspe_rate[:,:,i]
+        up_bound, low_bound = np.nanquantile(tmp, 0.95), np.nanquantile(tmp, 0.05)
+        tmp[tmp>up_bound] = up_bound
+        tmp[tmp<low_bound] = low_bound
+        laspe_rate[:,:,i] = tmp
 
     # enlarge the boundary
     laspe_rate_full = np.zeros_like(input_coarse)*np.nan
     laspe_rate_full[1:-1,1:-1] = laspe_rate
-    return np.transpose(laspe_rate_full,(2,0,1)) # time first
+    return np.transpose(laspe_rate_full,(2,0,1)), x, y # time first
 
 
 def calc_clear_sky_emissivity(air_temperature, dew_temperature, case='satt'):
@@ -351,8 +358,7 @@ def downscale_air_temperature(air_temperature_coarse,
                               lat_coarse,
                               lon_coarse, year, month, begin_hour):
     # calculate lapse rate for air temperature
-    laspe_rate_coarse = calc_lapse_rate(np.transpose(air_temperature_coarse, (1,2,0)), elevation_coarse)
-    print(laspe_rate_coarse.shape)
+    laspe_rate_coarse, x, y = calc_lapse_rate(np.transpose(air_temperature_coarse, (1,2,0)), elevation_coarse)
     # bilinear interpolate of laspe rate 
     laspe_rate_fine_interp = bilinear_interp_from_cdo('laspe_rate', 
                                                       lat_coarse, 
@@ -374,14 +380,17 @@ def downscale_dew_temperature(dew_temperature_coarse,
                               elevation_fine_interp, 
                               elevation_fine,
                               lat_coarse,
-                              lon_coarse):
+                              lon_coarse, year, month, begin_hour):
     # calculate lapse rate for dew temperature
     laspe_rate_coarse = calc_lapse_rate(dew_temperature_coarse, elevation_coarse)
     # bilinear interpolate of laspe rate
     laspe_rate_fine_interp = bilinear_interp_from_cdo('laspe_rate', 
                                                       lat_coarse, 
                                                       lon_coarse, 
-                                                      laspe_rate_coarse)
+                                                      laspe_rate_coarse,
+                                                      year,
+                                                      month,
+                                                      begin_hour)
     # downscaling
     dz = (elevation_fine-elevation_fine_interp)[:,:,np.newaxis]
     dew_temperature_fine = dew_temperature_fine_interp + np.multiply(
