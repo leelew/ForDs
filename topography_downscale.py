@@ -155,10 +155,10 @@ def calc_lapse_rate(input_coarse, elevation_coarse):
     # enlarge the boundary
     laspe_rate_full = np.zeros_like(input_coarse)*np.nan
     laspe_rate_full[1:-1,1:-1] = laspe_rate
-    return np.transpose(laspe_rate_full,(2,0,1)), x, y # time first
+    return np.transpose(laspe_rate_full,(2,0,1)) # time first
 
 
-def calc_clear_sky_emissivity(air_temperature, dew_temperature, case='satt'):
+def calc_clear_sky_emissivity(air_temperature, dew_temperature, case='konz'):
     """Calculate emissivity in clear-sky."""
     vapor_pressure, _, _, _ = calc_vapor_pressure(dew_temperature)
     if case == 'brut': # Brutsaert (1975)
@@ -358,7 +358,7 @@ def downscale_air_temperature(air_temperature_coarse,
                               lat_coarse,
                               lon_coarse, year, month, begin_hour):
     # calculate lapse rate for air temperature
-    laspe_rate_coarse, x, y = calc_lapse_rate(np.transpose(air_temperature_coarse, (1,2,0)), elevation_coarse)
+    laspe_rate_coarse = calc_lapse_rate(np.transpose(air_temperature_coarse, (1,2,0)), elevation_coarse)
     # bilinear interpolate of laspe rate 
     laspe_rate_fine_interp = bilinear_interp_from_cdo('laspe_rate', 
                                                       lat_coarse, 
@@ -382,7 +382,7 @@ def downscale_dew_temperature(dew_temperature_coarse,
                               lat_coarse,
                               lon_coarse, year, month, begin_hour):
     # calculate lapse rate for dew temperature
-    laspe_rate_coarse = calc_lapse_rate(dew_temperature_coarse, elevation_coarse)
+    laspe_rate_coarse = calc_lapse_rate(np.transpose(dew_temperature_coarse, (1,2,0)), elevation_coarse)
     # bilinear interpolate of laspe rate
     laspe_rate_fine_interp = bilinear_interp_from_cdo('laspe_rate', 
                                                       lat_coarse, 
@@ -392,7 +392,7 @@ def downscale_dew_temperature(dew_temperature_coarse,
                                                       month,
                                                       begin_hour)
     # downscaling
-    dz = (elevation_fine-elevation_fine_interp)[:,:,np.newaxis]
+    dz = (elevation_fine-elevation_fine_interp)[np.newaxis]
     dew_temperature_fine = dew_temperature_fine_interp + np.multiply(
             laspe_rate_fine_interp, dz)
     return dew_temperature_fine
@@ -456,7 +456,7 @@ def downscale_in_longwave_radiation(in_longwave_radiation_coarse,
                                     dew_temperature_fine,
                                     air_temperature_fine_interp,
                                     lat_coarse,
-                                    lon_coarse):
+                                    lon_coarse, year, month, day_of_month):
     # calculate emissivity of coarse and fine resolution
     emissivity_clear_sky_coarse = calc_clear_sky_emissivity(air_temperature_coarse, dew_temperature_coarse)
     emissivity_clear_sky_fine = calc_clear_sky_emissivity(air_temperature_fine, dew_temperature_fine)
@@ -472,11 +472,13 @@ def downscale_in_longwave_radiation(in_longwave_radiation_coarse,
     emissivity_cloudy_fine_interp = bilinear_interp_from_cdo('emissivity_cloudy',
                                                              lat_coarse,
                                                              lon_coarse,
-                                                             emissivity_cloudy_coarse)
+                                                             emissivity_cloudy_coarse,
+                                                             year, month, day_of_month)
     emissivity_all_fine_interp = bilinear_interp_from_cdo('emissivity_all',
                                                            lat_coarse,
                                                            lon_coarse,
-                                                           emissivity_all_coarse)
+                                                           emissivity_all_coarse,
+                                                           year, month, day_of_month)
     # calculate all emissivity in fine
     emissivity_all_fine = emissivity_clear_sky_fine+emissivity_cloudy_fine_interp
 
@@ -581,7 +583,7 @@ def downscale_wind_speed(u_wind_speed_fine_interp,
     wind_speed_fine_interp = np.sqrt(u_wind_speed_fine_interp**2+v_wind_speed_fine_interp**2)
 
     # compute the slope in the direction of the wind
-    slope_wind_direction_fine = slope_fine*np.cos(wind_direction_fine_interp-aspect_fine)
+    slope_wind_direction_fine = slope_fine[np.newaxis]*np.cos(wind_direction_fine_interp-aspect_fine[np.newaxis])
 
     # normalize the slope in the direction of the wind into (-0.5,0.5)
     slope_wind_direction_fine = slope_wind_direction_fine/(2*np.max(slope_wind_direction_fine))
@@ -591,7 +593,7 @@ def downscale_wind_speed(u_wind_speed_fine_interp,
 
     # compute wind speed ajustment
     wind_speed_fine = wind_speed_fine_interp* \
-        (1+(0.58*slope_wind_direction_fine)+0.42*curvature_fine)
+        (1+(0.58*slope_wind_direction_fine)+0.42*curvature_fine[np.newaxis])
     return wind_speed_fine
 
 
@@ -601,8 +603,8 @@ def downscale_precipitation_colm(precipitation_coarse,
                                  case='tesfa'):
     # NOTE: only for square inputs
     scale = round(elevation_fine.shape[0]/elevation_coarse.shape[0])
-    nlat, nlon, nt = precipitation_coarse.shape
-    precipitation_fine = np.full((elevation_fine.shape[0],elevation_fine.shape[1],nt), np.nan)
+    nt, nlat, nlon = precipitation_coarse.shape
+    precipitation_fine = np.full((nt, elevation_fine.shape[0],elevation_fine.shape[1]), np.nan)
     
     for i in range(nlat):
         for j in range(nlon):
@@ -615,14 +617,13 @@ def downscale_precipitation_colm(precipitation_coarse,
                 zs = elevation_fine[i*scale:(i+1)*scale, j*scale:]
             else:
                 zs = elevation_fine[i*scale:, j*scale:]
-            zs = zs[:,:,np.newaxis] # expand dimension for oprend with time dimensions
             
-            # calculate precip
-            pg, zg = precipitation_coarse[i:i+1,j:j+1], elevation_coarse[i,j]
+            # calculate precip (nt,1,1) (1,)
+            pg, zg = precipitation_coarse[:,i:i+1,j:j+1], elevation_coarse[i,j]
             if case == 'tesfa':
                 # Tesfa et al, 2020: Exploring Topography-Based Methods for Downscaling
                 # Subgrid Precipitation for Use in Earth System Models. Equation (5).
-                zs_max = np.nanmax(zs)
+                zs_max = np.nanmax(zs) 
                 tmp = pg*(zs-zg)/zs_max
             elif case == 'liston':
                 # Liston and Elder: A meteorological distribution system for high-resolution 
@@ -631,13 +632,14 @@ def downscale_precipitation_colm(precipitation_coarse,
            
             # rewrite in outfile
             if (i != nlat-1) & (j != nlon-1):
-                precipitation_fine[i*scale:(i+1)*scale, j*scale:(j+1)*scale] = tmp
+                precipitation_fine[:,i*scale:(i+1)*scale, j*scale:(j+1)*scale] = tmp
             elif (i == nlat-1) & (j != nlon-1):
-                precipitation_fine[i*scale:, j*scale:(j+1)*scale] = tmp
+                precipitation_fine[:,i*scale:, j*scale:(j+1)*scale] = tmp
             elif (i != nlat-1) & (j == nlon-1):
-                precipitation_fine[i*scale:(i+1)*scale, j*scale:] = tmp
+                precipitation_fine[:,i*scale:(i+1)*scale, j*scale:] = tmp
             else:
-                precipitation_fine[i*scale:, j*scale:] = tmp
+                precipitation_fine[:,i*scale:, j*scale:] = tmp
+    precipitation_fine[precipitation_fine<0] = 0
     return precipitation_fine
 
 

@@ -2,7 +2,7 @@ import os
 import numpy as np
 import netCDF4 as nc
 from multiprocessing import Process
-from topography_downscale import downscale_air_temperature 
+from topography_downscale import downscale_air_temperature, downscale_dew_temperature, downscale_air_pressure,downscale_specific_humidity, downscale_in_longwave_radiation, downscale_wind_speed, downscale_precipitation_colm  
 import time
 
 
@@ -38,6 +38,12 @@ def main(year, month, day_of_month):
     elevation_fine_interp = f['hgt'][:]
     f = nc.Dataset(DATA_PATH+'forcing/ERA5LAND_GD_2018_01_t2m.nc', 'r')
     lat_coarse, lon_coarse = f['latitude'][:], f['longitude'][:]
+    f = nc.Dataset(DATA_PATH+'DEM/MERITDEM/MERITDEM_GD_Aspect.nc', 'r')
+    aspect_fine = f['asp'][:]
+    f = nc.Dataset(DATA_PATH+'DEM/MERITDEM/MERITDEM_GD_Slope.nc', 'r')
+    slope_fine = f['slp'][:]
+    f = nc.Dataset(DATA_PATH+'DEM/MERITDEM/MERITDEM_GD_curvature.nc', 'r')
+    curvature_fine = f['cur'][:]
 
     
     # downscale air temperature
@@ -57,6 +63,8 @@ def main(year, month, day_of_month):
                                                      month,
                                                      day_of_month)
     t2 = time.time()
+    print('processing {year:04}-{month:02}-{day:02}'.format(year=year, month=month, day=day_of_month))
+    print('processing t2m')
     print(t2-t1)
     print(air_temperature_fine.shape)
     save2nc('t2m', year, month, day_of_month, air_temperature_fine)
@@ -79,6 +87,7 @@ def main(year, month, day_of_month):
                                                      month,
                                                      day_of_month)
     t2 = time.time()
+    print('processing d2m')
     print(t2-t1)
     print(dew_temperature_fine.shape)
     save2nc('d2m', year, month, day_of_month, dew_temperature_fine)
@@ -95,6 +104,7 @@ def main(year, month, day_of_month):
                                                elevation_fine_interp,
                                                elevation_fine)
     t2 = time.time()
+    print('processing sp')
     print(t2-t1)
     print(air_pressure_fine.shape)
     save2nc('sp', year, month, day_of_month, air_pressure_fine)
@@ -105,10 +115,67 @@ def main(year, month, day_of_month):
     specific_humidity_fine = downscale_specific_humidity(air_pressure_fine,
                                                          dew_temperature_fine)
     t2 = time.time()
+    print('processing Q')
     print(t2-t1)
     print(specific_humidity_fine.shape)
     save2nc('Q', year, month, day_of_month, specific_humidity_fine)
 
+
+    # downscale longwave
+    f = nc.Dataset(DATA_PATH+'forcing/ERA5LAND_GD_{year:04}_{month:02}_strd_interp.nc'.format(year=year, month=month), 'r')    
+    in_longwave_radiation_fine_interp = f['strd'][day_of_month*24:day_of_month*24+24,:,:]    
+    f = nc.Dataset(DATA_PATH+'forcing/ERA5LAND_GD_{year:04}_{month:02}_strd.nc'.format(year=year, month=month), 'r')
+    in_longwave_radiation_coarse = f['strd'][day_of_month*24:day_of_month*24+24,:,:]    
+    in_longwave_radiation_fine = downscale_in_longwave_radiation(in_longwave_radiation_coarse,
+                                                                 in_longwave_radiation_fine_interp,
+                                                                 air_temperature_coarse,
+                                                                 dew_temperature_coarse,
+                                                                 air_temperature_fine,
+                                                                 dew_temperature_fine,
+                                                                 air_temperature_fine_interp,
+                                                                 lat_coarse,
+                                                                 lon_coarse, year, month, day_of_month)
+    print('processing longwave')
+    print(in_longwave_radiation_fine.shape)
+    save2nc('strd', year, month, day_of_month, in_longwave_radiation_fine)
+
+
+    # downscale precipitation
+    f = nc.Dataset(DATA_PATH+'forcing/ERA5LAND_GD_{year:04}_{month:02}_tp.nc'.format(year=year, month=month), 'r')
+    precipitation_coarse = f['tp'][day_of_month*24:day_of_month*24+24,:,:]
+    precipitation_fine = downscale_precipitation_colm(precipitation_coarse,
+                                                      elevation_coarse,
+                                                      elevation_fine,
+                                                      case='tesfa')
+    print('processing precipitation tesfa')
+    print(precipitation_fine.shape)
+    save2nc('tp_tesfa', year, month, day_of_month, precipitation_fine)
+
+
+    # downscale precipitation
+    precipitation_coarse = f['tp'][day_of_month*24:day_of_month*24+24,:,:]
+    precipitation_fine = downscale_precipitation_colm(precipitation_coarse,
+                                                      elevation_coarse,
+                                                      elevation_fine,
+                                                      case='liston')
+    print('processing precipitation liston')
+    print(precipitation_fine.shape)
+    save2nc('tp_liston', year, month, day_of_month, precipitation_fine)
+    
+
+    # downscale wind
+    f = nc.Dataset(DATA_PATH+'forcing/ERA5LAND_GD_{year:04}_{month:02}_u10_interp.nc'.format(year=year, month=month), 'r')
+    u_wind_speed_fine_interp = f['u10'][day_of_month*24:day_of_month*24+24,:,:]
+    f = nc.Dataset(DATA_PATH+'forcing/ERA5LAND_GD_{year:04}_{month:02}_v10_interp.nc'.format(year=year, month=month), 'r')
+    v_wind_speed_fine_interp = f['v10'][day_of_month*24:day_of_month*24+24,:,:]
+    wind_speed_fine = downscale_wind_speed(u_wind_speed_fine_interp,
+                         v_wind_speed_fine_interp,
+                         slope_fine,
+                         aspect_fine,
+                         curvature_fine) 
+    print('processing wind speed')
+    print(wind_speed_fine.shape)
+    save2nc('ws', year, month, day_of_month, wind_speed_fine)
 
 
 def par_main(year, month, begin_day, end_day):
@@ -128,10 +195,7 @@ def par_main(year, month, begin_day, end_day):
 
 
 if __name__ == '__main__':
-    par_main(2018, 1, 0, 5)
-    par_main(2018, 1, 6, 11)
-    par_main(2018, 1, 12, 17)
-    par_main(2018, 1, 18, 23)
-    par_main(2018, 1, 24, 31)
+    for i in range(31):
+        par_main(2018, 1, i, i+1)
 
 
