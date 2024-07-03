@@ -9,7 +9,7 @@ from utils import save2nc
 
 
 
-def pred(args, day_of_month, regressor, classifer, region_name, model_name, normalize=True):
+def pred(args, day_of_month, regressor, classifer, region_name, model_name, normalize=False):
     # load coare DEM data
     f = nc.Dataset(DATA_PATH+'DEM/SRTM/ERA5_height.nc', 'r')
     lat_coarse, lon_coarse = f['latitude'][:], f['longitude'][:]
@@ -19,24 +19,24 @@ def pred(args, day_of_month, regressor, classifer, region_name, model_name, norm
     elev_coarse = f['hgt'][lat_coarse_index][:,lon_coarse_index]
 
     # load fine DEM data
-    f = nc.Dataset(DATA_PATH+'DEM/MERITDEM/MERITDEM_height.nc', 'r')
+    f = nc.Dataset(DATA_PATH+'DEM/MERITDEM/hgt.nc', 'r')
     lat_fine, lon_fine = f['latitude'][:], f['longitude'][:]
     lat_fine_index = np.where((lat_fine>=lat_coarse[-1]) & (lat_fine<=lat_coarse[0]))[0]
     lon_fine_index = np.where((lon_fine>=lon_coarse[0]) & (lon_fine<=lon_coarse[-1]))[0]
     lat_fine, lon_fine = lat_fine[lat_fine_index], lon_fine[lon_fine_index]
     elev_fine = f['hgt'][lat_fine_index][:,lon_fine_index]
     nx, ny = elev_fine.shape
-
+    
     # load test data
     x = np.load('x_test/{region_name}/x_test_{year:04}_{month}_{day}.npy'.format(
-        year=args.year, month=args.month, day=day_of_month, region_name=region_name))
+        year=args.year, month=args.month, day=day_of_month+1, region_name=region_name))
     idx = np.unique(np.where(np.isnan(x))[0])
     all_idx = np.arange(x.shape[0])
     rest_idx = np.delete(all_idx, idx, axis=0)
     x1 = np.delete(x, idx, axis=0)
     y = np.full((x.shape[0],1), np.nan)
     del x
-
+    
     # 
     if normalize:
         norm = np.load('norm.npy')
@@ -48,7 +48,7 @@ def pred(args, day_of_month, regressor, classifer, region_name, model_name, norm
         sp_min, sp_max = norm[:,5,0], norm[:,5,1]
         ws_min, ws_max = norm[:,6,0], norm[:,6,1]
         elev_max = norm[:,7,0]
-
+    
     # predict
     value_fine = regressor.predict(x1)
     mask_fine = classifer.predict(x1)
@@ -95,6 +95,7 @@ if __name__ == '__main__':
     DATA_PATH=DATA_PATH+args.region_name+'/'
 
     # load trained model
+    print('Load trained models')
     MODEL_PATH = "/tera05/lilu/ForDs/run/models/" + args.region_name + '/'
     f = open(MODEL_PATH+"{model_name}_cls_{year}.pkl".format(model_name=args.model_name,year=args.year, region_name=args.region_name),'rb')
     classifer = cloudpickle.load(f)
@@ -102,5 +103,5 @@ if __name__ == '__main__':
     regressor = cloudpickle.load(f)
     classifer.n_jobs = 1
     regressor.n_jobs = 1
-    
+    print('Models stand by!')
     par_pred(args, regressor, classifer)
