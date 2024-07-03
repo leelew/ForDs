@@ -1,18 +1,21 @@
 #-----------------------------------------------------------------------------
-# The topography downscale methods for forcing 
+# The topography downscaling methods for atmospheric forcing 
 #
-# Author: Lu Li, Sisi Chen, Zhongwang Wei
+# Author: Lu Li, Sisi Chen
 # Reference:
 #   Mei et al. (2020): A Nonparametric Statistical Technique for Spatial 
 #       Downscaling of Precipitation Over High Mountain Asia, 
 #       Water Resourse Research, 56, e2020WR027472.
 #   Rouf et al. (2020): A Physically Based Atmospheric Variables Downscaling 
 #       Technique. Journal of Hydrometeorology, 21, 93-108.
+#   Sisi Chen, Lu Li, Yongjiu Dai, et al. Exploring Topography Downscaling 
+#       Methods for Hyper-Resolution Land Surface Modeling. 
 #-----------------------------------------------------------------------------
 import numpy as np
 from sklearn.linear_model import LinearRegression
 
 from utils import bilInterp
+
 
 
 def date2jd(year, month, day_of_month):
@@ -26,6 +29,7 @@ def date2jd(year, month, day_of_month):
 
     jday = jday+day_of_month
     return jday
+
 
 def calc_vapor_pressure(temperature):
     """Calculate vapor pressure according to Buck (1981).
@@ -114,8 +118,11 @@ def calc_lapse_rate(input_coarse, elevation_coarse):
     x = calc_space_diff(elevation_coarse)
     
     # calculate laspe rate of input according to elevation
-    laspe_rate = regression(y, x)
-    
+    try:
+        laspe_rate = regression(y, x)
+    except:
+        laspe_rate = np.ones_like(y[0])*0.006
+
     # control the boundary of lapse rate
     for i in range(laspe_rate.shape[-1]):
         tmp = laspe_rate[:,:,i]
@@ -157,8 +164,6 @@ def downscale_air_temperature(air_temperature_coarse,
                               elevation_fine,
                               lat_coarse,
                               lon_coarse,
-                              lat_fine,
-                              lon_fine, 
                               year, 
                               month, 
                               day_of_month):
@@ -187,8 +192,6 @@ def downscale_dew_temperature(dew_temperature_coarse,
                               elevation_fine,
                               lat_coarse,
                               lon_coarse, 
-                              lat_fine,
-                              lon_fine,
                               year, 
                               month, 
                               day_of_month):
@@ -343,8 +346,8 @@ def calc_solar_angles(julian_day, hour, latitude, longitude):
             data for climate impact studies. Earth Syst. Sci. Data.
     """
     # calculate solar hour angle (deg)
+    # Calculate 均时差E_qt, derived from SZA func in R Atmosphere library 
     # @Sisi Chen, 2023-09-18
-    # 计算均时差E_qt,来自R语言中RAtmosphere包中SZA函数：
     if julian_day <= 106 :
         E_qt = -14.2 * np.sin(np.pi*(julian_day + 7)/111)
     elif julian_day <= 166:
@@ -355,7 +358,7 @@ def calc_solar_angles(julian_day, hour, latitude, longitude):
         E_qt = 16.4 * np.sin(np.pi * (julian_day - 247)/113)
     lon, lat = np.meshgrid(longitude,latitude)
     hour_angle = 15*(12-(hour+E_qt/60+lon/15))
-    
+   
     # calculate solar declination angle (deg)
     declin_angle = 23.45*np.sin(np.deg2rad(360*(284+julian_day)/365))
     
@@ -375,6 +378,69 @@ def calc_solar_angles(julian_day, hour, latitude, longitude):
     return np.arccos(cos_zenith), np.arccos(cos_azimuth) # (rad)
 
 
+def diff_rad_adjust(sky_view_factor_fine, 
+                    diffuse_radiation_fine_interp, 
+                    cos_illumination, 
+                    beam_radiation_fine,
+                    toa_in_short_radiation_fine_interp,
+                    slope_fine, 
+                    beam_radiation_fine_interp,
+                    scheme=1):
+    if scheme == 1:
+        # isotropic scattering
+        return sky_view_factor_fine*diffuse_radiation_fine_interp
+    elif scheme == 2:
+        # consider antisotropic scattering. 
+        # 
+        # Huang et al., (2022). Development of a clear‐sky 3D sub‐grid terrain 
+        #   solar radiative effect parameterization scheme based on the mountain radiation theory. 
+        #   Journal of Geophysical Research: Atmospheres, 127(13), e2022JD036449. equation (4)
+        # TODO: Need reframe variable names @Chen
+        diffuse_radiation_fine = diffuse_radiation_fine_interp
+        for i in range(24):
+            idx1 = np.where(cos_illumination[i]>0)
+            ratio1 = beam_radiation_fine[i][idx1]/toa_in_short_radiation_fine_interp[i][idx1]
+            ratio2 = beam_radiation_fine_interp[i][idx1]/toa_in_short_radiation_fine_interp[i][idx1]
+            idx3 = np.where((ratio1>1)|(ratio2>1))
+            ratio1[idx3] = 0
+            ratio2[idx3] = 0
+            ratio1[ratio1<0] = 0
+            ratio2[ratio2<0] = 0
+            diffuse_radiation_fine[i][idx1] = diffuse_radiation_fine_interp[i][idx1]*(ratio1+\
+                                0.5*sky_view_factor_fine[idx1]*(1+np.cos(slope_fine[idx1]))*(1-ratio2))
+            idx2 = np.where(cos_illumination[i]<=0)
+            ratio3 = beam_radiation_fine_interp[i][idx2]/toa_in_short_radiation_fine_interp[i][idx2]
+            idx4 = np.where(ratio3>1)
+            ratio3[idx4] = 0
+            ratio3[ratio3<0] = 0
+            diffuse_radiation_fine[i][idx2] = diffuse_radiation_fine_interp[i][idx2]*(
+                0.5*sky_view_factor_fine[idx2]*(1+np.cos(slope_fine[idx2]))*(1-ratio3))
+        return diffuse_radiation_fine
+
+
+def cal_sf(azimuth_angle_fine, zenith_angle_fine, sf_lut, sf_lut_f, sf_lut_b, scheme=1):
+    shadow_mask = np.zeros_like(azimuth_angle_fine)
+    idx = np.array(np.int64(azimuth_angle_fine/1.5)) # (24,lat,lon)
+    for i in range(24):
+        for n in range(idx.shape[1]):
+            for m in range(idx.shape[2]):
+                if scheme == 1:
+                    theta1=np.arcsin(sf_lut_f[n,m,idx[i,n,m]])
+                    theta2=np.arcsin(sf_lut_b[n,m,idx[i,n,m]])
+                    if np.pi/2-zenith_angle_fine[i,n,m] < theta2:
+                        shadow_mask[i,n,m] = 0
+                    elif np.pi/2-zenith_angle_fine[i,n,m] > theta1:
+                        shadow_mask[i,n,m] =1
+                    else:
+                        shadow_mask[i,n,m] = ((np.pi/2-zenith_angle_fine[i,n,m])-theta2)/(theta1-theta2)
+                else:
+                    if sf_lut[n,m,idx[i,n,m]] < np.cos(zenith_angle_fine[i,n,m]):
+                        shadow_mask[i,n,m] = 1
+                    else:
+                        shadow_mask[i,n,m] = 0   
+    return shadow_mask
+                
+
 def downscale_in_shortwave_radiation(in_short_radiation_coarse,
                                      air_pressure_coarse,
                                      air_pressure_fine,
@@ -391,7 +457,11 @@ def downscale_in_shortwave_radiation(in_short_radiation_coarse,
                                      lon_coarse,
                                      lat_fine,
                                      lon_fine,
-                                     lut_shadow_mask):
+                                     sf_lut,
+                                     sf_lut_f,
+                                     sf_lut_b,
+                                     shadow_mask_scheme=1,
+                                     diff_rad_adjust_scheme=1):
     # ------------------------------------------------------------
     # 1. partition short radiation into beam and diffuse radiation
     # ------------------------------------------------------------
@@ -412,14 +482,8 @@ def downscale_in_shortwave_radiation(in_short_radiation_coarse,
     # NOTE(@Chen): We trans azimuth angle from rad to degree
     #       because the index mostly equal to 0 if we 
     #       use rad (i.e., azimuth/1.5<1). 
-    shadow_mask = np.zeros_like(azimuth_angle_fine)
     azimuth_angle_fine = azimuth_angle_fine*180/np.pi # turn deg
-    idx = np.array(np.int64(azimuth_angle_fine/1.5)) # (24,lat,lon)
-    for i in range(24):
-        for n in range(idx.shape[1]):
-            for m in range(idx.shape[2]): 
-                if lut_shadow_mask[n,m,idx[i,n,m]] < np.cos(zenith_angle_fine[i,n,m]):
-                    shadow_mask[i,n,m] = 1
+    shadow_mask = cal_sf(azimuth_angle_fine, zenith_angle_fine, sf_lut, sf_lut_f, sf_lut_b, scheme=shadow_mask_scheme)
     azimuth_angle_fine = azimuth_angle_fine*np.pi/180 # turn rad
         
     # calculate top-of-atmosphere incident short radiation
@@ -475,7 +539,14 @@ def downscale_in_shortwave_radiation(in_short_radiation_coarse,
                                             year, 
                                             month, 
                                             day_of_month)  
-
+    toa_in_short_radiation_fine_interp = bilInterp('toa_in_short_radiation',
+                                                   lat_coarse, 
+                                                   lon_coarse,
+                                                   toa_in_short_radiation_coarse,
+                                                   year,
+                                                   month,
+                                                   day_of_month)
+    
     # calculate factor to account for the difference of 
     # optical path length due to pressure difference
     optical_length_factor_fine = np.exp(k_fine_interp*(
@@ -491,17 +562,14 @@ def downscale_in_shortwave_radiation(in_short_radiation_coarse,
     # above the local horizon (note that values lower than 0 are set to 0);
     cos_illumination = np.cos(slope_fine)+ \
         np.tan(zenith_angle_fine)*np.sin(slope_fine)* \
-            np.cos(azimuth_angle_fine-aspect_fine) 
+            np.cos(azimuth_angle_fine-aspect_fine)
     cos_illumination[:,np.cos(slope_fine)==1] = 1
     cos_illumination[cos_illumination>1] = 1
     cos_illumination[cos_illumination<0] = 0
 
     # downscaling beam radiation
     beam_radiation_fine_interp[beam_radiation_fine_interp<0] = np.nan
-    beam_radiation_fine =np.zeros_like(beam_radiation_fine_interp)
-    for i in range(24):
-     beam_radiation_fine[i] = shadow_mask[i]*cos_illumination[i]* \
-        optical_length_factor_fine[i]*beam_radiation_fine_interp[i] 
+    beam_radiation_fine = shadow_mask*cos_illumination*beam_radiation_fine_interp*optical_length_factor_fine
 
     # ------------------------------------------------------------
     # 3. downscaling diffuse radiation 
@@ -510,20 +578,81 @@ def downscale_in_shortwave_radiation(in_short_radiation_coarse,
     sky_view_factor_fine[sky_view_factor_fine>1] = 1
     sky_view_factor_fine[sky_view_factor_fine<0] = 0
     diffuse_radiation_fine_interp[diffuse_radiation_fine_interp<0] = np.nan
-    diffuse_radiation_fine = sky_view_factor_fine*diffuse_radiation_fine_interp
+    diffuse_radiation_fine = diff_rad_adjust(sky_view_factor_fine, 
+                                             diffuse_radiation_fine_interp, 
+                                             cos_illumination, 
+                                             beam_radiation_fine,
+                                             toa_in_short_radiation_fine_interp,
+                                             slope_fine, 
+                                             beam_radiation_fine_interp,
+                                             diff_rad_adjust_scheme)
     
     # ------------------------------------------------------------
     # 4. calculate reflected radiation 
     # ------------------------------------------------------------ 
     albedo_fine = black_sky_albedo*(1-diffuse_weight_fine_interp)+white_sky_albedo*(diffuse_weight_fine_interp)
     terrain_factor_fine = ((1+np.cos(slope_fine))/2)-sky_view_factor_fine
-    terrain_factor_fine = terrain_factor_fine - 1.00001*np.nanmin(terrain_factor_fine[terrain_factor_fine<0])
+    if len(terrain_factor_fine[terrain_factor_fine<0]) != 0:
+        terrain_factor_fine = terrain_factor_fine - 1.00001*np.nanmin(terrain_factor_fine[terrain_factor_fine<0])
     reflected_radiation_fine = albedo_fine*terrain_factor_fine* \
         (beam_radiation_fine*np.cos(zenith_angle_fine)+(1-sky_view_factor_fine)*diffuse_radiation_fine)
     
+    # for diagnose
+    """ 
+    np.save('in_short_radiation_coarse_{month}_{day}'.format(month=month, day=day_of_month), np.array(in_short_radiation_coarse))
+    np.save('beam_radiation_coarse_{month}_{day}'.format(month=month, day=day_of_month), np.array(beam_radiation_coarse))
+    np.save('diffuse_radiation_coarse_{month}_{day}'.format(month=month, day=day_of_month), np.array(diffuse_radiation_coarse))
+    np.save('beam_radiation_fine_interp_{month}_{day}'.format(month=month, day=day_of_month), np.array(beam_radiation_fine_interp))
+    np.save('diffuse_radiation_fine_interp_{month}_{day}'.format(month=month, day=day_of_month), np.array(diffuse_radiation_fine_interp))
+    np.save('cos_illumination_{month}_{day}'.format(month=month, day=day_of_month), np.array(cos_illumination))
+    np.save('shadow_mask_{month}_{day}'.format(month=month, day=day_of_month), np.array(shadow_mask))
+    np.save('optical_length_factor_fine_{month}_{day}'.format(month=month, day=day_of_month), np.array(optical_length_factor_fine))
+    np.save('diffuse_radiation_fine_{month}_{day}'.format(month=month, day=day_of_month), np.array(diffuse_radiation_fine))
+    np.save('reflected_radiation_fine_{month}_{day}'.format(month=month, day=day_of_month), np.array(reflected_radiation_fine))
+    """
+
     return np.array(cos_illumination)*np.array(shadow_mask)*np.array(beam_radiation_fine_interp)*np.array(optical_length_factor_fine)+\
         np.array(diffuse_radiation_fine)+np.array(reflected_radiation_fine)
 
+
+def downscale_precipitation_colm(precipitation_coarse,
+                                 elevation_coarse,
+                                 elevation_fine):
+     # NOTE: only for square inputs
+    scale = round(elevation_fine.shape[0]/elevation_coarse.shape[0])
+    nt, nlat, nlon = precipitation_coarse.shape
+    precipitation_fine = np.full((nt, elevation_fine.shape[0],elevation_fine.shape[1]), np.nan)
+
+    for i in range(nlat):
+        for j in range(nlon):
+            # handle the boundary problem caused by Not-INT scale 
+            if (i != nlat-1) & (j != nlon-1):
+                zs = elevation_fine[i*scale:(i+1)*scale, j*scale:(j+1)*scale]
+            elif (i == nlat-1) & (j != nlon-1):
+                zs = elevation_fine[i*scale:, j*scale:(j+1)*scale]
+            elif (i != nlat-1) & (j == nlon-1):
+                zs = elevation_fine[i*scale:(i+1)*scale, j*scale:]
+            else:
+                zs = elevation_fine[i*scale:, j*scale:]
+
+            # calculate precip
+            pg, zg = precipitation_coarse[:,i:i+1,j:j+1], elevation_coarse[i,j]
+
+            # Subgrid Precipitation for Use in Earth System Models. Equation (5).
+            zs_max = np.nanmax(zs)
+            tmp = pg*(1+(zs-zg)/zs_max)
+
+            # rewrite in outfile
+            if (i != nlat-1) & (j != nlon-1):
+                precipitation_fine[:, i*scale:(i+1)*scale, j*scale:(j+1)*scale] = tmp
+            elif (i == nlat-1) & (j != nlon-1):
+                precipitation_fine[:, i*scale:, j*scale:(j+1)*scale] = tmp
+            elif (i != nlat-1) & (j == nlon-1):
+                precipitation_fine[:, i*scale:(i+1)*scale, j*scale:] = tmp
+            else:
+                precipitation_fine[:, i*scale:, j*scale:] = tmp
+    return precipitation_fine
+   
 
 def downscale_precipitation(
                             air_temperature_fine,
@@ -545,7 +674,7 @@ def downscale_precipitation(
 
     # auxillary
     julian_day = []
-    jday0 = date2jd(year, month, day_of_month+1) # day of month must plus 1 to start from 1
+    jday0 = date2jd(year, month, day_of_month) # day of month must plus 1 to start from 1
     for i in range(24):
         julian_day.append(jday0)
     julian_day = np.array(julian_day)   
