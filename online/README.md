@@ -7,7 +7,7 @@
 
 After selecting the simulation regions, CoLM will read high-resolution topographic factors for downscaling process. `topocalc_CoLM` is an automatic tool to generate topographic factors in NetCDF4 types. This tool is based on [topocalc](https://github.com/USDA-ARS-NWRC/topocalc) package developed by USDA ARS Northwest Watershed Research Center with several modifications:
 1) Add the calculation of curvature based on methods from ArcGIS.
-2) Change the range of aspect (radian) from [-$\pi$, $\pi$] to [0, 2$\pi$].
+2) Change the range of aspect (radian) from [$-\pi$, $\pi$] to [0, $2\pi$].
 3) Consider the effect of spatial resolution in the calculation of horizon.
 
 Input your DEM data, and run:
