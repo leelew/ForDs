@@ -1,9 +1,10 @@
 import numpy as np
 import xarray as xr
 import netCDF4 as nc
-from topocalc.gradient import gradient_d8
-from topocalc.viewf import viewf
-from topocalc.cur import calc_cur
+
+from gradient import gradient_d8
+from viewf import viewf
+from cur import calc_cur
 
 
 def main(dem, dx, dy, lat, lon, spacing):
@@ -29,33 +30,25 @@ def main(dem, dx, dy, lat, lon, spacing):
 
 
 def save2nc(lat, lon, H, varname, filename, dim_size=2):
+    f = nc.Dataset(f"{filename}.nc", "w", format="NETCDF4")
+    
+    f.createDimension("lat", size=len(lat))
+    f.createDimension("lon", size=len(lon))
+    lats = f.createVariable("lat", "f4", dimensions="lat")
+    lons = f.createVariable("lon", "f4", dimensions="lon")
+    lats[:] = lat
+    lons[:] = lon
+
+    H[np.isnan(H)] = -9999
+
     if dim_size == 2:
-        f=nc.Dataset(f"./{filename}.nc","w",format="NETCDF4")
-        f.createDimension("lat",size = len(lat))
-        f.createDimension("lon",size = len(lon))
-        lats=f.createVariable("lat", "f4", dimensions="lat")
-        lons=f.createVariable("lon", "f4", dimensions="lon")
         vars=f.createVariable(varname, "f8", dimensions=("lat","lon"), fill_value = -9999.)
-        lats[:] = lat
-        lons[:] = lon
-        # Set the missing value to -9999
-        H[np.isnan(H)] = -9999
-        vars[:] = H
-        f.close()  
-    else:
-        f=nc.Dataset(f"./{filename}.nc","w",format="NETCDF4")
+    elif dim_size == 3:
         f.createDimension("azimuth",size = 36)
-        f.createDimension("lat",size = len(lat))
-        f.createDimension("lon",size = len(lon))
-        lats=f.createVariable("lat","f4",dimensions = "lat")
-        lons=f.createVariable("lon","f4",dimensions = "lon")
         vars=f.createVariable(varname,"f8",dimensions=("lat","lon","azimuth"), fill_value = -9999.)
-        lats[:] = lat
-        lons[:] = lon
-        # Set the missing value to -9999
-        H[np.isnan(H)] = -9999
-        vars[:] = H
-        f.close()
+
+    vars[:] = H
+    f.close()
 
 
 

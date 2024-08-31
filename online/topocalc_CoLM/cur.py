@@ -2,6 +2,7 @@ import numpy as np
 
 
 def cur(dem, dx, dy):
+    """ArcGIS method to calcuate curvature"""
     # Pad the dem
     dem_pad = np.pad(dem, pad_width=1, mode='edge')
 
