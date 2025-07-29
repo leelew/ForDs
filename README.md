@@ -24,7 +24,8 @@ In case you use ForDs in your research or work, please cite this preprint:
     author = {SisiChen, Lu Li, Yongjiu Dai et al.},
     title = {Exploring Topography Downscaling Methods for Hyper-Resolution Land Surface Modeling},
     year = {2024},
-    DOI = {10.22541/au.171403656.68476353/v1}
+    journal = {Journal of Geophysical Research: Atmospheres},
+    DOI = {10.1029/2024JD041338}
 }
 ```
 
