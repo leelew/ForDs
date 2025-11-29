@@ -16,8 +16,7 @@ land surface data, especially over highly elevated areas.
 
 ### Citation
 
-This work is under review in Journal of Geophysical Research: Atmospheres.
-In case you use ForDs in your research or work, please cite this preprint:
+In case you use ForDs in your research or work, please cite this paper:
 
 ```bibtex
 @article{Lu Li,
